@@ -1,0 +1,45 @@
+set shell := ["/bin/bash", "-cu"]
+
+default:
+  @just --list
+
+regen-schema:
+  cargo run -p tellers-timeline-schema --bin tellers-timeline-schema --quiet
+
+# Regenerate docs/otio-reference.md (the format reference) from the core types
+regen-docs:
+  cargo run -p tellers-timeline-schema --bin otio-docs --quiet
+
+# Fail when docs/otio-reference.md does not match the code (what CI's docs job runs)
+check-docs: regen-docs
+  git diff --exit-code -- docs/otio-reference.md || { echo "docs/otio-reference.md is stale: commit the regenerated file"; exit 1; }
+
+build-all:
+  cargo build --workspace --all-targets --exclude tellers-timeline-wasm --exclude tellers-timeline-python
+
+# Runs Rust tests, Python tests (via maturin develop), and wasm tests
+# Requires Python and Node toolchains installed
+test-all:
+  cargo test -p tellers-timeline-core -p tellers-timeline-schema -q
+  # Python binding tests
+  if command -v maturin >/dev/null 2>&1; then \
+    cd bindings/python && \
+    maturin develop -q && \
+    cd ../.. && \
+    if [ -d bindings/python/.venv ]; then \
+      bindings/python/.venv/bin/python -m pip install -q pytest opentimelineio && \
+      bindings/python/.venv/bin/python -m pytest -q bindings/python/tests; \
+    else \
+      python -m pip install -q pytest opentimelineio && \
+      python -m pytest -q bindings/python/tests; \
+    fi; \
+  else \
+    echo "maturin not found, skipping python tests"; \
+  fi
+  # JS wasm build (no runtime tests for now)
+  rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
+  cargo build -p tellers-timeline-wasm --target wasm32-unknown-unknown -q
+
+# Start the visual test UI (builds the Python bindings first)
+ui *ARGS:
+  tools/timeline-ui/run.sh {{ARGS}}

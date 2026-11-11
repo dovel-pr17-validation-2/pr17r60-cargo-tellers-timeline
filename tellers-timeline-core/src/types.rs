@@ -1,0 +1,1964 @@
+use schemars::JsonSchema;
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
+
+pub type Seconds = f64;
+
+fn default_timeline_schema() -> String {
+    "Timeline.1".to_string()
+}
+fn default_track_schema() -> String {
+    "Track.1".to_string()
+}
+fn default_stack_schema() -> String {
+    "Stack.1".to_string()
+}
+fn default_clip_schema() -> String {
+    "Clip.2".to_string()
+}
+fn default_gap_schema() -> String {
+    "Gap.1".to_string()
+}
+fn default_transition_schema() -> String {
+    "Transition.1".to_string()
+}
+fn default_transition_type() -> String {
+    "SMPTE_Dissolve".to_string()
+}
+fn default_time_range_schema() -> String {
+    "TimeRange.1".to_string()
+}
+fn default_rational_time_schema() -> String {
+    "RationalTime.1".to_string()
+}
+/// `effect_name`s of the tellers `Transform` effect (prefixed, and bare as
+/// written before tellers effects were prefixed).
+const TELLERS_TRANSFORM_NAMES: [&str; 2] = ["tellers.ai.Transform", "Transform"];
+
+/// The placement a Rich Text generator carries in its own Resolve
+/// parameters (`position` in [0, 1], zoom, rotation), as an offset from the
+/// center; the identity for other references. Only ever read.
+fn rich_text_placement(reference: &MediaReference) -> MediaReferencePosition {
+    let mut placement = MediaReferencePosition {
+        x: 0.0,
+        y: 0.0,
+        rotation: 0.0,
+        zoom_x: 1.0,
+        zoom_y: 1.0,
+    };
+    let MediaReference::GeneratorReference { parameters, .. } = reference else {
+        return placement;
+    };
+    let rich_text = parameters
+        .resolve_otio
+        .iter()
+        .flatten()
+        .filter(|effect| effect.effect_name == "Rich Text");
+    for parameter in rich_text.flat_map(|effect| &effect.parameters) {
+        match parameter {
+            ResolveOTIOParameter::PointF(param) if param.parameter_id == "position" => {
+                if let Some([x, y]) = param.parameter_value {
+                    placement.x = x - 0.5;
+                    placement.y = y - 0.5;
+                }
+            }
+            ResolveOTIOParameter::Double(param) if param.parameter_id == "transformationZoomX" => {
+                placement.zoom_x = param.parameter_value;
+            }
+            ResolveOTIOParameter::Double(param) if param.parameter_id == "transformationZoomY" => {
+                placement.zoom_y = param.parameter_value;
+            }
+            ResolveOTIOParameter::Double(param) if param.parameter_id == "transformationRotationAngle" => {
+                placement.rotation = param.parameter_value;
+            }
+            _ => {}
+        }
+    }
+    placement
+}
+
+/// The parameters of the first tellers `Transform` effect in `effects`.
+fn tellers_transform_parameters(
+    effects: &[Effect],
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    effects
+        .iter()
+        .filter(|effect| TELLERS_TRANSFORM_NAMES.contains(&effect.effect_name.as_str()))
+        .find_map(|effect| {
+            effect
+                .metadata
+                .other
+                .get("tellers.ai")?
+                .get("parameters")?
+                .as_object()
+        })
+}
+
+/// A tellers animatable parameter's value at the start of the clip: the
+/// number, or the value of its earliest keyframe.
+fn animatable_start_value(value: &serde_json::Value) -> Option<f64> {
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    value
+        .get("keyframes")?
+        .as_array()?
+        .iter()
+        .filter_map(|k| Some((k.get("t")?.as_f64()?, k.get("v")?.as_f64()?)))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, v)| v)
+}
+
+/// Write `values` into the first tellers `Transform` effect of `effects`
+/// (appended when there is none), under its `tellers.ai.Transform` name,
+/// dropping `scale` and keeping its other parameters and keys.
+fn set_tellers_transform_parameters<const N: usize>(
+    effects: &mut Vec<Effect>,
+    values: [(&str, f64); N],
+) {
+    let index = match effects
+        .iter()
+        .position(|effect| TELLERS_TRANSFORM_NAMES.contains(&effect.effect_name.as_str()))
+    {
+        Some(index) => index,
+        None => {
+            // Built from JSON so that every other field takes its default.
+            let effect: Effect = serde_json::from_value(serde_json::json!({
+                "OTIO_SCHEMA": "Effect.1",
+                "name": "",
+                "effect_name": TELLERS_TRANSFORM_NAMES[0],
+                "metadata": {},
+            }))
+            .expect("a tellers Transform effect");
+            effects.push(effect);
+            effects.len() - 1
+        }
+    };
+    let effect = &mut effects[index];
+    effect.effect_name = TELLERS_TRANSFORM_NAMES[0].to_string();
+    let ai = effect
+        .metadata
+        .other
+        .entry("tellers.ai")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !ai.is_object() {
+        *ai = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let parameters = ai
+        .as_object_mut()
+        .expect("tellers.ai is an object")
+        .entry("parameters")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !parameters.is_object() {
+        *parameters = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let parameters = parameters.as_object_mut().expect("parameters is an object");
+    parameters.remove("scale");
+    for (key, value) in values {
+        parameters.insert(key.to_string(), serde_json::json!(value));
+    }
+}
+
+fn default_effect_schema() -> String {
+    "Effect.1".to_string()
+}
+fn default_enabled() -> bool {
+    true
+}
+
+pub(crate) fn gen_hex_id_12() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 6];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+pub(crate) fn ensure_tellers_ai_with_id(mut meta: serde_json::Value) -> serde_json::Value {
+    // Ensure we have an object at the root
+    if meta.as_object().is_none() {
+        meta = serde_json::Value::Object(serde_json::Map::new());
+    }
+
+    // Work with a mutable map and migrate legacy key if present
+    let map = meta.as_object_mut().unwrap();
+
+    // Read legacy `tellers_id` from metadata root if present.
+    // TODO: remove legacy `tellers_id` once frontend is updated
+    let legacy_id_opt = map
+        .get("tellers_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Ensure we have an object at metadata["tellers.ai"]
+    let ai_entry = map
+        .entry("tellers.ai".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if ai_entry.as_object().is_none() {
+        *ai_entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let ai_map = ai_entry.as_object_mut().unwrap();
+
+    // If timeline_id is missing, prefer the legacy id; otherwise generate a new one
+    let has_timeline_id = ai_map.get("timeline_id").and_then(|v| v.as_str()).is_some();
+    if !has_timeline_id {
+        let final_id = legacy_id_opt.unwrap_or_else(gen_hex_id_12);
+        ai_map.insert(
+            "timeline_id".to_string(),
+            serde_json::Value::String(final_id),
+        );
+    }
+
+    meta
+}
+
+fn deserialize_media_metadata<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let mut meta = v.unwrap_or(serde_json::Value::Null);
+
+    // Ensure we have an object at the root
+    if meta.as_object().is_none() {
+        meta = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let map = meta.as_object_mut().unwrap();
+
+    // Pre-read possible legacy fields before mutably borrowing the tellers.ai map
+    let root_media_id = map.get("media_id").cloned();
+    let root_score = map.get("score").cloned();
+    let root_keyframe_id = map.get("keyframe_id").cloned();
+
+    // Ensure we have an object at metadata["tellers.ai"]
+    let ai_entry = map
+        .entry("tellers.ai".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if ai_entry.as_object().is_none() {
+        *ai_entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let ai_map = ai_entry.as_object_mut().unwrap();
+
+    // Duplicate legacy media fields under tellers.ai if missing there
+    // TODO: remove legacy media fields (media_id, score, keyframe_id) from root once frontend is updated
+    if !ai_map.contains_key("media_id") {
+        if let Some(v) = root_media_id {
+            ai_map.insert("media_id".to_string(), v);
+        }
+    }
+    if !ai_map.contains_key("score") {
+        if let Some(v) = root_score {
+            ai_map.insert("score".to_string(), v);
+        }
+    }
+    if !ai_map.contains_key("keyframe_id") {
+        if let Some(v) = root_keyframe_id {
+            ai_map.insert("keyframe_id".to_string(), v);
+        }
+    }
+
+    Ok(meta)
+}
+
+pub(crate) fn deserialize_metadata_with_id<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let meta = v.unwrap_or(serde_json::Value::Null);
+    Ok(ensure_tellers_ai_with_id(meta))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Timeline {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_timeline_schema")]
+    pub otio_schema: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub tracks: Stack,
+    #[serde(default, deserialize_with = "deserialize_metadata_with_id")]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Track {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_track_schema")]
+    pub otio_schema: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_track_kind_case_insensitive")]
+    pub kind: TrackKind,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(rename = "children", default)]
+    pub items: Vec<Item>,
+    #[serde(default, deserialize_with = "deserialize_metadata_with_id")]
+    pub metadata: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<Effect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<crate::Marker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Stack {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_stack_schema")]
+    pub otio_schema: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub children: Vec<Track>,
+    #[serde(default, deserialize_with = "deserialize_metadata_with_id")]
+    pub metadata: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<Effect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<crate::Marker>,
+    /// Set on the working stack [`Stack::with_composite_mut`] lends out: its
+    /// tracks are a composite's, whose trailing gaps are part of its length,
+    /// so sanitize keeps them.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub composite_content: bool,
+}
+
+impl Default for Stack {
+    fn default() -> Self {
+        Self {
+            otio_schema: default_stack_schema(),
+            name: None,
+            children: vec![],
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            effects: Vec::new(),
+            markers: Vec::new(),
+            composite_content: false,
+        }
+    }
+}
+
+/// Serialized as OTIO spells it (`"Video"`, `"Audio"`); read case-insensitively.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+pub enum TrackKind {
+    Video,
+    Audio,
+    Other,
+}
+
+fn deserialize_track_kind_case_insensitive<'de, D>(deserializer: D) -> Result<TrackKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    let lower = s.to_ascii_lowercase();
+    match lower.as_str() {
+        "video" => Ok(TrackKind::Video),
+        "audio" => Ok(TrackKind::Audio),
+        "other" => Ok(TrackKind::Other),
+        _ => Err(D::Error::unknown_variant(&s, &["video", "audio", "other"])),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
+#[serde(untagged)]
+pub enum Item {
+    Clip(Clip),
+    Gap(Gap),
+    /// A nested `Stack.*` inside a track: a composite clip drawn as one clip
+    /// made of its own tracks (see [`CompositeStack`]).
+    Composite(CompositeStack),
+    Transition(Transition),
+}
+
+impl<'de> Deserialize<'de> for Item {
+    /// Dispatch on `OTIO_SCHEMA`: a `Gap.*` schema deserializes as [`Gap`], a
+    /// `Stack.*` schema as [`CompositeStack`], a `Transition.*` schema as
+    /// [`Transition`], everything else as [`Clip`].
+    ///
+    /// A plain `#[serde(untagged)]` deserialize would always match [`Clip`]
+    /// first — every `Clip` field but `source_range` is `#[serde(default)]`, so
+    /// a gap object parses cleanly as a `Clip` and the `Gap` variant is never
+    /// reached. Dispatching on the schema keeps gaps as gaps on the way in.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let schema_name = value
+            .get("OTIO_SCHEMA")
+            .and_then(|schema| schema.as_str())
+            .map(|schema| schema.split('.').next().unwrap_or(schema));
+        let is = |name: &str| schema_name.is_some_and(|schema| schema.eq_ignore_ascii_case(name));
+        if is("Gap") {
+            Gap::deserialize(value).map(Item::Gap).map_err(D::Error::custom)
+        } else if is("Stack") {
+            CompositeStack::deserialize(value)
+                .map(Item::Composite)
+                .map_err(D::Error::custom)
+        } else if is("Transition") {
+            Transition::deserialize(value)
+                .map(Item::Transition)
+                .map_err(D::Error::custom)
+        } else {
+            Clip::deserialize(value)
+                .map(Item::Clip)
+                .map_err(D::Error::custom)
+        }
+    }
+}
+
+// No longer used; OTIO-only shape is parsed directly above
+
+impl Item {
+    pub fn bind_default_media_reference_when_needed(&mut self) {
+        match self {
+            Item::Clip(c) => c.bind_default_media_reference_when_needed(),
+            Item::Gap(_) | Item::Transition(_) => {}
+            Item::Composite(s) => s.for_each_item_mut(&mut |item| {
+                item.bind_default_media_reference_when_needed()
+            }),
+        }
+    }
+    pub fn clamp_to_active_available_range(&mut self) {
+        match self {
+            Item::Clip(c) => c.clamp_to_active_available_range(),
+            Item::Gap(_) | Item::Transition(_) => {}
+            Item::Composite(s) => {
+                for track in &mut s.children {
+                    track.clamp_clips_to_available_ranges();
+                }
+            }
+        }
+    }
+    /// Track-time duration of the item. Transitions take no track time (they
+    /// overlap their neighbours instead), so they always report `0.0`.
+    pub fn duration(&self) -> Seconds {
+        match self {
+            Item::Clip(c) => c.source_range.duration.to_seconds(),
+            Item::Gap(g) => g.source_range.duration.to_seconds(),
+            Item::Composite(s) => s.duration(),
+            Item::Transition(_) => 0.0,
+        }
+    }
+    pub fn set_duration(&mut self, dur: Seconds) {
+        match self {
+            Item::Clip(c) => c.source_range.duration.set_from_seconds(dur),
+            Item::Gap(g) => g.source_range.duration.set_from_seconds(dur),
+            Item::Composite(s) => s.set_duration(dur),
+            Item::Transition(_) => {}
+        }
+    }
+    pub fn is_transition(&self) -> bool {
+        matches!(self, Item::Transition(_))
+    }
+    pub fn get_enabled(&self) -> bool {
+        match self {
+            Item::Clip(c) => c.enabled,
+            Item::Gap(_g) => true,
+            Item::Composite(s) => s.enabled.unwrap_or(true),
+            Item::Transition(t) => t.enabled.unwrap_or(true),
+        }
+    }
+    pub fn set_enabled(&mut self, enabled: bool) {
+        match self {
+            Item::Clip(c) => c.enabled = enabled,
+            Item::Gap(_) => {}
+            // Leave an absent key absent when it already means "enabled".
+            Item::Composite(s) if s.enabled.is_none() && enabled => {}
+            Item::Composite(s) => s.enabled = Some(enabled),
+            Item::Transition(t) if t.enabled.is_none() && enabled => {}
+            Item::Transition(t) => t.enabled = Some(enabled),
+        }
+    }
+    /// The item's source range. Transitions have none in OTIO; they report an
+    /// empty range so callers that only need a duration keep working.
+    pub fn get_source_range(&self) -> TimeRange {
+        match self {
+            Item::Clip(c) => c.source_range.clone(),
+            Item::Gap(g) => g.source_range.clone(),
+            Item::Composite(s) => s.resolved_source_range(),
+            Item::Transition(_) => TimeRange::new(0.0, 0.0),
+        }
+    }
+    pub fn set_source_range(&mut self, source_range: TimeRange) {
+        match self {
+            Item::Clip(c) => c.source_range = source_range,
+            Item::Gap(g) => g.source_range = source_range,
+            Item::Composite(s) => s.source_range = Some(source_range),
+            Item::Transition(_) => {}
+        }
+    }
+    pub fn get_active_media_reference_key(&self) -> Option<String> {
+        match self {
+            Item::Clip(c) => c.active_media_reference_key.clone(),
+            Item::Gap(_) | Item::Composite(_) | Item::Transition(_) => None,
+        }
+    }
+    pub fn set_active_media_reference_key(&mut self, key: Option<String>) {
+        if let Item::Clip(c) = self {
+            c.active_media_reference_key = key;
+        }
+    }
+    pub fn get_media_references(&self) -> HashMap<String, MediaReference> {
+        match self {
+            Item::Clip(c) => c.media_references.clone(),
+            Item::Gap(_) | Item::Composite(_) | Item::Transition(_) => HashMap::new(),
+        }
+    }
+    pub fn set_media_references(&mut self, references: HashMap<String, MediaReference>) {
+        if let Item::Clip(c) = self {
+            c.media_references = references;
+        }
+    }
+    /// Clear the `target_url` on every media reference and every effect (see
+    /// [`crate::effect_assets`]) of this item, including the clips nested
+    /// inside a composite.
+    pub fn clear_target_urls(&mut self) {
+        self.clear_effect_target_urls();
+        self.clear_media_target_urls();
+    }
+    fn clear_media_target_urls(&mut self) {
+        match self {
+            Item::Clip(c) => {
+                for reference in c.media_references.values_mut() {
+                    reference.clear_target_url();
+                }
+            }
+            Item::Gap(_) | Item::Transition(_) => {}
+            Item::Composite(s) => s.for_each_item_mut(&mut Item::clear_media_target_urls),
+        }
+    }
+    pub fn get_effects(&self) -> Vec<Effect> {
+        match self {
+            Item::Clip(c) => c.effects.clone(),
+            Item::Gap(g) => g.effects.clone(),
+            Item::Composite(s) => s.effects.clone(),
+            Item::Transition(_) => Vec::new(),
+        }
+    }
+    pub fn set_effects(&mut self, effects: Vec<Effect>) {
+        match self {
+            Item::Clip(c) => c.effects = effects,
+            Item::Gap(g) => g.effects = effects,
+            Item::Composite(s) => s.effects = effects,
+            Item::Transition(_) => {}
+        }
+    }
+    /// The clip's position; the identity for gaps and composites, which have
+    /// no media reference to place.
+    pub fn get_position(&self) -> MediaReferencePosition {
+        match self {
+            Item::Clip(c) => c.get_position(),
+            Item::Gap(_) | Item::Composite(_) | Item::Transition(_) => MediaReferencePosition {
+                x: 0.0,
+                y: 0.0,
+                rotation: 0.0,
+                zoom_x: 1.0,
+                zoom_y: 1.0,
+            },
+        }
+    }
+    pub fn set_position(&mut self, position: MediaReferencePosition) {
+        if let Item::Clip(c) = self {
+            c.set_position(position);
+        }
+    }
+    /// The Rich Text Title HTML of this item's active media reference, if any.
+    /// None for gaps, composites and non-rich-text clips.
+    pub fn get_rich_text(&self) -> Option<String> {
+        match self {
+            Item::Clip(c) => c.get_rich_text(),
+            Item::Gap(_) | Item::Composite(_) | Item::Transition(_) => None,
+        }
+    }
+    pub fn get_crop(&self) -> MediaReferenceCrop {
+        match self {
+            Item::Clip(c) => c.get_crop(),
+            Item::Gap(_) | Item::Composite(_) | Item::Transition(_) => MediaReferenceCrop::default(),
+        }
+    }
+    pub fn set_crop(&mut self, crop: MediaReferenceCrop) {
+        if let Item::Clip(c) = self {
+            c.set_crop(crop);
+        }
+    }
+}
+
+/// A `Stack` nested inside a track: a composite clip, drawn as one clip made
+/// of its own tracks (the player's `CompositeStack`).
+///
+/// Its length is `source_range.duration` when a source range is set, otherwise
+/// the length of its longest child track. `source_range.start_time` is the
+/// offset into the child tracks where the composite starts playing.
+///
+/// The player draws one level of nesting: a `Stack` inside a composite's
+/// track is skipped. This library loads and edits composites at any depth.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct CompositeStack {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_stack_schema")]
+    pub otio_schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range: Option<TimeRange>,
+    #[serde(default)]
+    pub children: Vec<Track>,
+    #[serde(default, deserialize_with = "deserialize_metadata_with_id")]
+    pub metadata: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<Effect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<crate::Marker>,
+}
+
+impl CompositeStack {
+    pub fn new(children: Vec<Track>, name: Option<String>, id: Option<String>) -> Self {
+        let mut s = CompositeStack {
+            otio_schema: default_stack_schema(),
+            enabled: None,
+            name,
+            source_range: None,
+            children,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            effects: Vec::new(),
+            markers: Vec::new(),
+        };
+        crate::metadata::IdMetadataExt::set_id(&mut s, Some(id.unwrap_or_else(gen_hex_id_12)));
+        s
+    }
+
+    /// The length of the longest child track.
+    pub fn content_duration(&self) -> Seconds {
+        self.children
+            .iter()
+            .map(Track::total_duration)
+            .fold(0.0, Seconds::max)
+    }
+
+    /// `source_range.duration` when set, otherwise [`Self::content_duration`].
+    pub fn duration(&self) -> Seconds {
+        match &self.source_range {
+            Some(range) => range.duration.to_seconds(),
+            None => self.content_duration(),
+        }
+    }
+
+    /// Set the composite's length. Without a source range one is added,
+    /// starting at the beginning of the child tracks.
+    pub fn set_duration(&mut self, duration: Seconds) {
+        let content_duration = self.content_duration();
+        self.source_range
+            .get_or_insert_with(|| TimeRange::new(content_duration, 0.0))
+            .duration
+            .set_from_seconds(duration);
+    }
+
+    /// The offset into the child tracks where the composite starts playing.
+    pub fn source_start(&self) -> Seconds {
+        self.source_range
+            .as_ref()
+            .map_or(0.0, |range| range.start_time.to_seconds())
+    }
+
+    /// Set the offset into the child tracks. Without a source range one is
+    /// added that keeps the current duration.
+    pub fn set_source_start(&mut self, start: Seconds) {
+        let duration = self.duration();
+        self.source_range
+            .get_or_insert_with(|| TimeRange::new(duration, 0.0))
+            .start_time
+            .set_from_seconds(start);
+    }
+
+    /// The source range, or the implicit one (whole content from 0) when unset.
+    pub fn resolved_source_range(&self) -> TimeRange {
+        self.source_range
+            .clone()
+            .unwrap_or_else(|| TimeRange::new(self.content_duration(), 0.0))
+    }
+
+    /// Give every child track and item (recursively) a fresh id, as for a copy.
+    pub fn assign_new_child_ids(&mut self) {
+        use crate::metadata::IdMetadataExt;
+        for track in &mut self.children {
+            track.set_id(Some(gen_hex_id_12()));
+            for item in &mut track.items {
+                item.set_id(Some(gen_hex_id_12()));
+                if let Item::Composite(nested) = item {
+                    nested.assign_new_child_ids();
+                }
+            }
+        }
+    }
+
+    /// Visit every item of the child tracks (callers recurse into nested
+    /// composites through the item itself).
+    pub fn for_each_item_mut(&mut self, f: &mut dyn FnMut(&mut Item)) {
+        for track in &mut self.children {
+            for item in &mut track.items {
+                f(item);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Clip {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_clip_schema")]
+    pub otio_schema: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub source_range: TimeRange,
+    #[serde(default)]
+    pub media_references: HashMap<String, MediaReference>,
+    #[serde(default)]
+    pub active_media_reference_key: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_metadata_with_id")]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub effects: Vec<Effect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<crate::Marker>,
+}
+
+impl Clip {
+    /// The Rich Text Title HTML of this clip's active media reference, if it is
+    /// a Rich generator reference. Mirrors the app's `extractTitleBlobHtml`.
+    pub fn get_rich_text(&self) -> Option<String> {
+        let key = self
+            .active_media_reference_key
+            .as_deref()
+            .unwrap_or("DEFAULT_MEDIA");
+        self.media_references.get(key)?.get_rich_text()
+    }
+
+    pub fn bind_default_media_reference_when_needed(&mut self) {
+        if self
+            .active_media_reference_key
+            .as_ref()
+            .is_some_and(|key| self.media_references.contains_key(key))
+        {
+            return;
+        }
+
+        self.active_media_reference_key = if self.media_references.contains_key("DEFAULT_MEDIA") {
+            Some("DEFAULT_MEDIA".to_string())
+        } else {
+            self.media_references.keys().next().cloned()
+        };
+    }
+
+    pub fn clamp_to_active_available_range(&mut self) {
+        let Some(active_key) = self
+            .active_media_reference_key
+            .as_deref()
+            .filter(|key| self.media_references.contains_key(*key))
+        else {
+            self.source_range.duration.value = self.source_range.duration.value.max(0.0);
+            return;
+        };
+
+        let Some(available_range) = self
+            .media_references
+            .get(active_key)
+            .and_then(|reference| reference.available_range().as_ref())
+        else {
+            self.source_range.duration.value = self.source_range.duration.value.max(0.0);
+            return;
+        };
+
+        let media_start = available_range.start_time.to_seconds().max(0.0);
+        let media_duration = available_range.duration.to_seconds().max(0.0);
+        let media_end = media_start + media_duration;
+        let source_start = self.source_range.start_time.to_seconds().max(media_start);
+        let requested_end =
+            (self.source_range.start_time.to_seconds() + self.source_range.duration.to_seconds())
+                .max(source_start);
+        let clamped_end = requested_end.min(media_end);
+
+        self.source_range.start_time.set_from_seconds(source_start);
+        if self.get_speed().is_some() {
+            // The duration is timeline time: keep it while the media it plays
+            // fits, else shorten it to what is left of the media.
+            let duration = (requested_end - source_start).max(0.0);
+            let available = (media_end - source_start).max(0.0);
+            let duration = if self.source_offset(duration) <= available + 1e-9 {
+                duration
+            } else {
+                self.timeline_duration_for_source(available).unwrap_or(duration).min(duration)
+            };
+            self.source_range.duration.set_from_seconds(duration);
+            return;
+        }
+        self.source_range
+            .duration
+            .set_from_seconds((clamped_end - source_start).max(0.0));
+    }
+
+    /// Resolve link-group sync id from Resolve OTIO metadata (`Link Group ID`).
+    pub fn sync_clips_id(&self) -> Option<i64> {
+        Self::resolve_otio_i64(&self.metadata, "Link Group ID")
+    }
+
+    pub(crate) fn resolve_otio_i64(metadata: &serde_json::Value, key: &str) -> Option<i64> {
+        let raw = metadata
+            .get("Resolve_OTIO")
+            .or_else(|| metadata.get("resolve"))
+            .and_then(|v| v.get(key))?;
+        raw.as_i64()
+            .or_else(|| raw.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .or_else(|| raw.as_str().and_then(|value| value.parse::<i64>().ok()))
+    }
+
+    pub fn new_single_media_reference(
+        source_range: TimeRange,
+        reference: MediaReference,
+        name: Option<String>,
+        id: Option<String>,
+    ) -> Self {
+        let mut refs = HashMap::new();
+        refs.insert("DEFAULT_MEDIA".to_string(), reference);
+        let mut c = Clip {
+            otio_schema: default_clip_schema(),
+            enabled: true,
+            name,
+            source_range,
+            media_references: refs,
+            active_media_reference_key: Some("DEFAULT_MEDIA".to_string()),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            effects: Vec::new(),
+            markers: Vec::new(),
+        };
+        crate::metadata::IdMetadataExt::set_id(&mut c, Some(id.unwrap_or_else(gen_hex_id_12)));
+        c
+    }
+
+    pub fn new(
+        source_range: TimeRange,
+        media_references: HashMap<String, MediaReference>,
+        active_media_reference_key: Option<String>,
+        name: Option<String>,
+        id: Option<String>,
+    ) -> Self {
+        let mut c = Clip {
+            otio_schema: default_clip_schema(),
+            enabled: true,
+            name,
+            source_range,
+            media_references,
+            active_media_reference_key,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            effects: Vec::new(),
+            markers: Vec::new(),
+        };
+        crate::metadata::IdMetadataExt::set_id(&mut c, Some(id.unwrap_or_else(gen_hex_id_12)));
+        c
+    }
+
+    pub fn get_position(&self) -> MediaReferencePosition {
+        let active_media_reference = self.media_references.get(self.active_media_reference_key.as_ref().unwrap()).unwrap();
+        // MediaReferencePosition uses [-0.5, +0.5] with (0, 0) at the screen center,
+        // matching Resolve's transformationPan/Tilt space where 0 is centered.
+        if let MediaReference::GeneratorReference { .. } = active_media_reference {
+            // Generators (Text, Shape, Rich Text) are placed by the tellers
+            // `Transform` effect, composed on top of a Rich Text clip's own
+            // Resolve placement, as the player does.
+            let base = rich_text_placement(active_media_reference);
+            let transform = tellers_transform_parameters(&self.effects);
+            let value = |key: &str, fallback: f64| {
+                transform
+                    .and_then(|t| t.get(key))
+                    .and_then(animatable_start_value)
+                    .unwrap_or(fallback)
+            };
+            let scale = value("scale", 1.0);
+            return MediaReferencePosition {
+                x: base.x + value("x", 0.0),
+                y: base.y + value("y", 0.0),
+                rotation: base.rotation + value("rotation", 0.0),
+                zoom_x: base.zoom_x * scale * value("scaleX", 1.0),
+                zoom_y: base.zoom_y * scale * value("scaleY", 1.0),
+            };
+        }
+        let mut x = 0.0;
+        let mut y = 0.0;
+        let mut rotation = 0.0;
+        let mut zoom_x = 1.0;
+        let mut zoom_y = 1.0;
+        for effect in &self.effects {
+            if effect.effect_name == "Resolve Effect" {
+                if let Some(resolve_otio_effect) = effect.metadata.resolve_otio.as_ref(){
+                    if resolve_otio_effect.effect_name == "Transform" {
+                    for parameter in &resolve_otio_effect.parameters {
+                    match parameter {
+                        ResolveOTIOParameter::Double(param) if param.parameter_id == "transformationPan" => {
+                            x = param.parameter_value;
+                        }
+                        ResolveOTIOParameter::Double(param) if param.parameter_id == "transformationTilt" => {
+                            y = param.parameter_value;
+                        }
+                        ResolveOTIOParameter::Double(param) if param.parameter_id == "transformationZoomX" => {
+                            zoom_x = param.parameter_value;
+                        }
+                        ResolveOTIOParameter::Double(param) if param.parameter_id == "transformationZoomY" => {
+                            zoom_y = param.parameter_value;
+                        }
+                        ResolveOTIOParameter::Double(param) if param.parameter_id == "transformationRotationAngle" => {
+                            rotation = param.parameter_value;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            }
+            }
+        }
+        MediaReferencePosition {
+            x,
+            y,
+            rotation,
+            zoom_x,
+            zoom_y,
+        }
+    }
+
+    /// Place this clip at `position`.
+    ///
+    /// Video and image clips take a Resolve Transform effect. Generators
+    /// (Text, Shape, Rich Text) take the tellers `Transform` effect the player
+    /// reads for them; a Rich Text clip's own Resolve placement is only read,
+    /// never written: the effect holds the difference from it. Its `x`, `y`,
+    /// `scaleX`, `scaleY` and `rotation` become plain numbers (keyframes on
+    /// them are replaced), `scale` is folded into `scaleX`/`scaleY`, and other
+    /// parameters such as `opacity` are kept.
+    pub fn set_position(&mut self, position: MediaReferencePosition) {
+        let active_media_reference = self.media_references.get(self.active_media_reference_key.as_ref().unwrap()).unwrap();
+
+        if let MediaReference::GeneratorReference { .. } = active_media_reference {
+            let base = rich_text_placement(active_media_reference);
+            let ratio = |value: f64, base: f64| if base != 0.0 { value / base } else { value };
+            set_tellers_transform_parameters(
+                &mut self.effects,
+                [
+                    ("x", position.x - base.x),
+                    ("y", position.y - base.y),
+                    ("scaleX", ratio(position.zoom_x, base.zoom_x)),
+                    ("scaleY", ratio(position.zoom_y, base.zoom_y)),
+                    ("rotation", position.rotation - base.rotation),
+                ],
+            );
+        } else {
+            // Case 2: ExternalReference - uses "transformationPan" and "transformationTilt" (Double) for x/y coordinates
+            self.effects.retain(|effect| {
+                if effect.effect_name == "Resolve Effect" {
+                    if let Some(resolve_otio_effect) = &effect.metadata.resolve_otio {
+                        // Keep Volume effects, remove Transform effects
+                        if resolve_otio_effect.effect_name == "Transform" {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+
+            let transform_effect = ResolveOTIOEffect {
+                effect_name: "Transform".to_string(),
+                enabled: true,
+                name: "Transform".to_string(),
+                parameters: vec![
+                    ResolveOTIOParameter::Double(ResolveOTIOParameterNumber {
+                        variant_type: "Double".to_string(),
+                        parameter_id: "transformationPan".to_string(),
+                        parameter_value: position.x,
+                        default_parameter_value: Some(0.0),
+                        max_value: Some(4.0),
+                        min_value: Some(-4.0),
+                    }),
+                    ResolveOTIOParameter::Double(ResolveOTIOParameterNumber {
+                        variant_type: "Double".to_string(),
+                        parameter_id: "transformationTilt".to_string(),
+                        parameter_value: position.y,
+                        default_parameter_value: Some(0.0),
+                        max_value: Some(4.0),
+                        min_value: Some(-4.0),
+                    }),
+                    ResolveOTIOParameter::Double(ResolveOTIOParameterNumber {
+                        variant_type: "Double".to_string(),
+                        parameter_id: "transformationZoomX".to_string(),
+                        parameter_value: position.zoom_x,
+                        default_parameter_value: Some(1.0),
+                        max_value: Some(100.0),
+                        min_value: Some(0.0),
+                    }),
+                    ResolveOTIOParameter::Double(ResolveOTIOParameterNumber {
+                        variant_type: "Double".to_string(),
+                        parameter_id: "transformationZoomY".to_string(),
+                        parameter_value: position.zoom_y,
+                        default_parameter_value: Some(1.0),
+                        max_value: Some(100.0),
+                        min_value: Some(0.0),
+                    }),
+                    ResolveOTIOParameter::Double(ResolveOTIOParameterNumber {
+                        variant_type: "Double".to_string(),
+                        parameter_id: "transformationRotationAngle".to_string(),
+                        parameter_value: position.rotation,
+                        default_parameter_value: Some(0.0),
+                        max_value: Some(100000.0),
+                        min_value: Some(-100000.0),
+                    }),
+                ],
+                effect_type: 2,
+            };
+
+            self.effects.push(Effect {
+                otio_schema: default_effect_schema(),
+                name: "".to_string(),
+                effect_name: "Resolve Effect".to_string(),
+                metadata: EffectMetadata {
+                    resolve_otio: Some(transform_effect),
+                    other: serde_json::Map::new(),
+                },
+                ..Effect::default()
+            });
+        }
+    }
+
+    pub fn get_crop(&self) -> MediaReferenceCrop {
+        for effect in &self.effects {
+            if effect.effect_name == "Resolve Effect" {
+                if let Some(resolve_otio_effect) = effect.metadata.resolve_otio.as_ref() {
+                    if resolve_otio_effect.effect_name == "Cropping"
+                        || resolve_otio_effect.name == "Cropping"
+                    {
+                        let mut crop = MediaReferenceCrop::default();
+                        for parameter in &resolve_otio_effect.parameters {
+                            if let ResolveOTIOParameter::Double(param) = parameter {
+                                match param.parameter_id.as_str() {
+                                    "cropLeft" => crop.crop_left = param.parameter_value,
+                                    "cropRight" => crop.crop_right = param.parameter_value,
+                                    "cropTop" => crop.crop_top = param.parameter_value,
+                                    "cropBottom" => crop.crop_bottom = param.parameter_value,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        return crop;
+                    }
+                }
+            }
+        }
+        MediaReferenceCrop::default()
+    }
+
+    pub fn set_crop(&mut self, crop: MediaReferenceCrop) {
+        let crop_left = clamp_crop_inset(crop.crop_left);
+        let crop_right = clamp_crop_inset(crop.crop_right);
+        let crop_top = clamp_crop_inset(crop.crop_top);
+        let crop_bottom = clamp_crop_inset(crop.crop_bottom);
+
+        self.effects.retain(|effect| {
+            if effect.effect_name == "Resolve Effect" {
+                if let Some(resolve_otio_effect) = &effect.metadata.resolve_otio {
+                    if resolve_otio_effect.effect_name == "Cropping"
+                        || resolve_otio_effect.name == "Cropping"
+                    {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+
+        let cropping_effect = ResolveOTIOEffect {
+            effect_name: "Cropping".to_string(),
+            enabled: true,
+            name: "Cropping".to_string(),
+            parameters: vec![
+                ResolveOTIOParameter::Double(ResolveOTIOParameterNumber {
+                    variant_type: "Double".to_string(),
+                    parameter_id: "cropLeft".to_string(),
+                    parameter_value: crop_left,
+                    default_parameter_value: Some(0.0),
+                    max_value: Some(1.0),
+                    min_value: Some(0.0),
+                }),
+                ResolveOTIOParameter::Double(ResolveOTIOParameterNumber {
+                    variant_type: "Double".to_string(),
+                    parameter_id: "cropRight".to_string(),
+                    parameter_value: crop_right,
+                    default_parameter_value: Some(0.0),
+                    max_value: Some(1.0),
+                    min_value: Some(0.0),
+                }),
+                ResolveOTIOParameter::Double(ResolveOTIOParameterNumber {
+                    variant_type: "Double".to_string(),
+                    parameter_id: "cropTop".to_string(),
+                    parameter_value: crop_top,
+                    default_parameter_value: Some(0.0),
+                    max_value: Some(1.0),
+                    min_value: Some(0.0),
+                }),
+                ResolveOTIOParameter::Double(ResolveOTIOParameterNumber {
+                    variant_type: "Double".to_string(),
+                    parameter_id: "cropBottom".to_string(),
+                    parameter_value: crop_bottom,
+                    default_parameter_value: Some(0.0),
+                    max_value: Some(1.0),
+                    min_value: Some(0.0),
+                }),
+            ],
+            effect_type: 3,
+        };
+
+        self.effects.push(Effect {
+            otio_schema: default_effect_schema(),
+            name: "".to_string(),
+            effect_name: "Resolve Effect".to_string(),
+            metadata: EffectMetadata {
+                resolve_otio: Some(cropping_effect),
+                other: serde_json::Map::new(),
+            },
+            ..Effect::default()
+        });
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Gap {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_gap_schema")]
+    pub otio_schema: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub source_range: TimeRange,
+    #[serde(default, deserialize_with = "deserialize_metadata_with_id")]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub effects: Vec<Effect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<crate::Marker>,
+}
+
+impl Gap {
+    pub fn new(duration: Seconds, id: Option<String>) -> Self {
+        let mut g = Gap {
+            otio_schema: default_gap_schema(),
+            name: None,
+            source_range: TimeRange {
+                otio_schema: default_time_range_schema(),
+                duration: RationalTime {
+                    otio_schema: default_rational_time_schema(),
+                    rate: 1.0,
+                    value: duration,
+                },
+                start_time: RationalTime {
+                    otio_schema: default_rational_time_schema(),
+                    rate: 1.0,
+                    value: 0.0,
+                },
+            },
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            effects: Vec::new(),
+            markers: Vec::new(),
+        };
+        crate::metadata::IdMetadataExt::set_id(&mut g, Some(id.unwrap_or_else(gen_hex_id_12)));
+        g
+    }
+    pub fn make_gap(duration: Seconds) -> Self {
+        Self::new(duration, None)
+    }
+}
+
+/// An OTIO `Transition.1` sitting between two neighbouring track items.
+///
+/// A transition takes no track time: `in_offset` says how far it reaches back
+/// into the item before it and `out_offset` how far it reaches into the item
+/// after it. The neighbours' `source_range`s do not include that overlap, so a
+/// renderer has to read extra media handles past each cut. `transition_type`
+/// is `SMPTE_Dissolve` for a standard dissolve; NLE-specific effects (e.g.
+/// DaVinci Resolve Fusion transitions) export as `Custom_Transition` with the
+/// details under `metadata`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Transition {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_transition_schema")]
+    pub otio_schema: String,
+    /// OTIO `enabled`; absent means enabled. The player skips a transition
+    /// whose `enabled` is `false` and plays a hard cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_transition_type")]
+    pub transition_type: String,
+    #[serde(default)]
+    pub in_offset: RationalTime,
+    #[serde(default)]
+    pub out_offset: RationalTime,
+    #[serde(default, deserialize_with = "deserialize_metadata_with_id")]
+    pub metadata: serde_json::Value,
+}
+
+impl Transition {
+    pub fn new(
+        in_offset: Seconds,
+        out_offset: Seconds,
+        transition_type: Option<String>,
+        id: Option<String>,
+    ) -> Self {
+        let mut t = Transition {
+            otio_schema: default_transition_schema(),
+            enabled: None,
+            name: None,
+            transition_type: transition_type.unwrap_or_else(default_transition_type),
+            in_offset: RationalTime::from_seconds(in_offset),
+            out_offset: RationalTime::from_seconds(out_offset),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        };
+        crate::metadata::IdMetadataExt::set_id(&mut t, Some(id.unwrap_or_else(gen_hex_id_12)));
+        t
+    }
+    /// Seconds the transition reaches back into the preceding item.
+    pub fn in_offset_seconds(&self) -> Seconds {
+        self.in_offset.to_seconds()
+    }
+    /// Seconds the transition reaches into the following item.
+    pub fn out_offset_seconds(&self) -> Seconds {
+        self.out_offset.to_seconds()
+    }
+    /// Total overlap covered by the transition (`in_offset + out_offset`).
+    pub fn overlap_seconds(&self) -> Seconds {
+        self.in_offset_seconds().max(0.0) + self.out_offset_seconds().max(0.0)
+    }
+}
+
+/// Variant type for Resolve_OTIO parameters
+/// Variant type for Resolve_OTIO parameters.
+/// Uses serde derive for Serialize with custom Deserialize for case-insensitive parsing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum VariantType {
+    Int,
+    Bool,
+    String,
+    Double,
+    UInt,
+    #[serde(rename = "POINTF")]
+    PointF,
+    Color,
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ResolveOTIOParameterNumber<T: Default> {
+    #[serde(rename = "Variant Type")]
+    pub variant_type: String,
+    #[serde(rename = "Parameter ID", default)]
+    pub parameter_id: String,
+    #[serde(rename = "Parameter Value", default)]
+    pub parameter_value: T,
+    #[serde(rename = "Default Parameter Value", default)]
+    pub default_parameter_value: Option<T>,
+    #[serde(rename = "maxValue", default)]
+    pub max_value: Option<T>,
+    #[serde(rename = "minValue", default)]
+    pub min_value: Option<T>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ResolveOTIOParameterSimple<T: Default> {
+    #[serde(rename = "Variant Type")]
+    pub variant_type: String,
+    #[serde(rename = "Parameter ID", default)]
+    pub parameter_id: String,
+    #[serde(rename = "Parameter Value", default)]
+    pub parameter_value: T,
+    #[serde(rename = "Default Parameter Value", default)]
+    pub default_parameter_value: Option<T>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ResolveOTIOParameterPointF {
+    #[serde(rename = "Variant Type")]
+    pub variant_type: String,
+    #[serde(rename = "Parameter ID", default)]
+    pub parameter_id: String,
+    #[serde(rename = "Parameter Value", default)]
+    pub parameter_value: Option<[f64; 2]>,
+    #[serde(rename = "Default Parameter Value", default)]
+    pub default_parameter_value: Option<[f64; 2]>,
+    #[serde(rename = "Key Frames", default)]
+    pub key_frames: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ResolveOTIOParameterUnknown {
+    #[serde(rename = "Parameter ID", default)]
+    pub parameter_id: String,
+    #[serde(rename = "Parameter Value", default)]
+    pub parameter_value: Option<serde_json::Value>,
+    #[serde(rename = "Default Parameter Value", default)]
+    pub default_parameter_value: Option<serde_json::Value>,
+    #[serde(rename = "Key Frames", default)]
+    pub key_frames: Option<serde_json::Value>,
+    #[serde(rename = "Title HTML", default)]
+    pub title_html: Option<String>,
+}
+
+
+
+#[derive(Debug, Clone, PartialEq, JsonSchema)]
+pub enum ResolveOTIOParameter {
+    Int(ResolveOTIOParameterNumber<i64>),
+    UInt(ResolveOTIOParameterNumber<u64>),
+    Double(ResolveOTIOParameterNumber<f64>),
+    Bool(ResolveOTIOParameterSimple<bool>),
+    String(ResolveOTIOParameterSimple<String>),
+    PointF(ResolveOTIOParameterPointF),
+    Color(ResolveOTIOParameterSimple<String>),
+    Unknown(ResolveOTIOParameterUnknown),
+}
+
+impl<'de> Deserialize<'de> for ResolveOTIOParameter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let variant_type_str = value.get("Variant Type").and_then(|v| v.as_str());
+        if let Some(variant_type_str) = variant_type_str {
+            // Try to deserialize based on variant type
+            match variant_type_str {
+                "Int" => {
+                    if let Ok(mut v) = serde_json::from_value::<ResolveOTIOParameterNumber<i64>>(value.clone()) {
+                        v.variant_type = "Int".to_string();
+                        return Ok(ResolveOTIOParameter::Int(v));
+                    }
+                }
+                "UInt" => {
+                    if let Ok(mut v) = serde_json::from_value::<ResolveOTIOParameterNumber<u64>>(value.clone()) {
+                        v.variant_type = "UInt".to_string();
+                        return Ok(ResolveOTIOParameter::UInt(v));
+                    }
+                }
+                "Double" => {
+                    if let Ok(mut v) = serde_json::from_value::<ResolveOTIOParameterNumber<f64>>(value.clone()) {
+                        v.variant_type = "Double".to_string();
+                        return Ok(ResolveOTIOParameter::Double(v));
+                    }
+                }
+                "Bool" => {
+                    if let Ok(mut v) = serde_json::from_value::<ResolveOTIOParameterSimple<bool>>(value.clone()) {
+                        v.variant_type = "Bool".to_string();
+                        return Ok(ResolveOTIOParameter::Bool(v));
+                    }
+                }
+                "String" => {
+                    if let Ok(mut v) = serde_json::from_value::<ResolveOTIOParameterSimple<String>>(value.clone()) {
+                        v.variant_type = "String".to_string();
+                        return Ok(ResolveOTIOParameter::String(v));
+                    }
+                }
+                "POINTF" => {
+                    if let Ok(mut v) = serde_json::from_value::<ResolveOTIOParameterPointF>(value.clone()) {
+                        v.variant_type = "POINTF".to_string();
+                        return Ok(ResolveOTIOParameter::PointF(v));
+                    }
+                }
+                "Color" => {
+                    if let Ok(mut v) = serde_json::from_value::<ResolveOTIOParameterSimple<String>>(value.clone()) {
+                        v.variant_type = "Color".to_string();
+                        return Ok(ResolveOTIOParameter::Color(v));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let unknown: ResolveOTIOParameterUnknown = serde_json::from_value(value)
+            .map_err(serde::de::Error::custom)?;
+
+        Ok(ResolveOTIOParameter::Unknown(unknown))
+    }
+}
+
+impl Serialize for ResolveOTIOParameter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            // For variants with variant_type field, serde will serialize it automatically
+            ResolveOTIOParameter::Int(v) => v.serialize(serializer),
+            ResolveOTIOParameter::UInt(v) => v.serialize(serializer),
+            ResolveOTIOParameter::Double(v) => v.serialize(serializer),
+            ResolveOTIOParameter::Bool(v) => v.serialize(serializer),
+            ResolveOTIOParameter::String(v) => v.serialize(serializer),
+            ResolveOTIOParameter::PointF(v) => v.serialize(serializer),
+            ResolveOTIOParameter::Color(v) => v.serialize(serializer),
+            // Unknown doesn't have variant_type, serialize directly
+            ResolveOTIOParameter::Unknown(v) => v.serialize(serializer),
+        }
+    }
+}
+
+
+impl ResolveOTIOParameter {
+    pub fn parameter_id(&self) -> &String {
+        match self {
+            ResolveOTIOParameter::Int(v) => &v.parameter_id,
+            ResolveOTIOParameter::UInt(v) => &v.parameter_id,
+            ResolveOTIOParameter::Double(v) => &v.parameter_id,
+            ResolveOTIOParameter::Bool(v) => &v.parameter_id,
+            ResolveOTIOParameter::String(v) => &v.parameter_id,
+            ResolveOTIOParameter::PointF(v) => &v.parameter_id,
+            ResolveOTIOParameter::Color(v) => &v.parameter_id,
+            ResolveOTIOParameter::Unknown(v) => &v.parameter_id,
+        }
+    }
+}
+
+
+
+/// Resolve_OTIO effect structure (used in media reference parameters array)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ResolveOTIOEffect {
+    #[serde(rename = "Effect Name")]
+    pub effect_name: String,
+    #[serde(default, rename = "Enabled")]
+    pub enabled: bool,
+    #[serde(default, rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Parameters", default)]
+    pub parameters: Vec<ResolveOTIOParameter>,
+    #[serde(rename = "Type", default)]
+    pub effect_type: u64,
+}
+
+/// Generator parameters structure for GeneratorReference
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
+pub struct GeneratorParameters {
+    #[serde(rename = "Resolve_OTIO", default, skip_serializing_if = "Option::is_none")]
+    pub resolve_otio: Option<Vec<ResolveOTIOEffect>>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Effect metadata structure - metadata is a map where "Resolve_OTIO" is typed
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub struct EffectMetadata {
+    #[serde(rename = "Resolve_OTIO", default, skip_serializing_if = "Option::is_none")]
+    pub resolve_otio: Option<ResolveOTIOEffect>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for EffectMetadata {
+    fn default() -> Self {
+        EffectMetadata {
+            resolve_otio: None,
+            other: serde_json::Map::new(),
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Effect {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_effect_schema")]
+    pub otio_schema: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub effect_name: String,
+    /// OTIO `enabled`; absent means enabled. The player skips an effect
+    /// whose `enabled` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub metadata: EffectMetadata,
+    /// Other OTIO keys (e.g. `time_scalar` of a `LinearTimeWarp.1`), kept as
+    /// they are.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for Effect {
+    fn default() -> Self {
+        Effect {
+            otio_schema: default_effect_schema(),
+            name: String::new(),
+            effect_name: String::new(),
+            enabled: None,
+            metadata: EffectMetadata::default(),
+            other: serde_json::Map::new(),
+        }
+    }
+}
+
+
+#[derive(Clone)]
+pub struct MediaReferencePosition {
+    pub x: f64,
+    pub y: f64,
+    pub rotation: f64,
+    pub zoom_x: f64,
+    pub zoom_y: f64,
+}
+
+#[derive(Clone)]
+pub struct MediaReferenceCrop {
+    pub crop_left: f64,
+    pub crop_right: f64,
+    pub crop_top: f64,
+    pub crop_bottom: f64,
+}
+
+impl Default for MediaReferenceCrop {
+    fn default() -> Self {
+        Self {
+            crop_left: 0.0,
+            crop_right: 0.0,
+            crop_top: 0.0,
+            crop_bottom: 0.0,
+        }
+    }
+}
+
+fn clamp_crop_inset(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    value.clamp(0.0, 1.0)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "OTIO_SCHEMA")]
+pub enum MediaReference {
+    /// OTIO's `MissingReference` is accepted as an alias and read as an
+    /// external reference with an empty `target_url`.
+    ///
+    /// Producers outside our control emit it: the OTIO AAF adapter answers
+    /// every SourceMob that records no locator URL with a `MissingReference`,
+    /// so importing an Avid sequence used to fail here — `unknown variant
+    /// MissingReference.1` — and take down the whole project load, even for
+    /// clips whose media we had resolved.
+    ///
+    /// It is an alias rather than a third variant because "no media yet" is
+    /// already what an empty `target_url` means throughout the pipeline
+    /// (`clear_target_urls` empties the field on every project we serve), and
+    /// because a distinct variant would force a meaning at each of the
+    /// matches on this enum for no behavioural gain. It re-serializes as
+    /// `ExternalReference.1`.
+    #[serde(rename = "ExternalReference.1", alias = "MissingReference.1")]
+    ExternalReference {
+        // Defaulted so a `MissingReference`, which carries no such field,
+        // lands as the empty target url that means "nothing to play yet".
+        #[serde(rename = "target_url", default)]
+        target_url: String,
+        #[serde(default)]
+        available_range: Option<TimeRange>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        available_image_bounds: Option<serde_json::Value>,
+        #[serde(default, deserialize_with = "deserialize_media_metadata")]
+        metadata: serde_json::Value,
+    },
+    #[serde(rename = "GeneratorReference.1")]
+    GeneratorReference {
+        #[serde(rename = "generator_kind")]
+        generator_kind: String,
+        #[serde(default)]
+        available_range: Option<TimeRange>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        available_image_bounds: Option<serde_json::Value>,
+        #[serde(default, deserialize_with = "deserialize_media_metadata")]
+        metadata: serde_json::Value,
+        #[serde(default)]
+        parameters: GeneratorParameters,
+    },
+}
+
+
+
+impl MediaReference {
+    pub fn available_range(&self) -> &Option<TimeRange> {
+        match self {
+            MediaReference::ExternalReference { available_range, .. } => available_range,
+            MediaReference::GeneratorReference { available_range, .. } => available_range,
+        }
+    }
+
+    pub fn available_range_mut(&mut self) -> &mut Option<TimeRange> {
+        match self {
+            MediaReference::ExternalReference { available_range, .. } => available_range,
+            MediaReference::GeneratorReference { available_range, .. } => available_range,
+        }
+    }
+
+    pub fn metadata(&self) -> &serde_json::Value {
+        match self {
+            MediaReference::ExternalReference { metadata, .. } => metadata,
+            MediaReference::GeneratorReference { metadata, .. } => metadata,
+        }
+    }
+
+    pub fn metadata_mut(&mut self) -> &mut serde_json::Value {
+        match self {
+            MediaReference::ExternalReference { metadata, .. } => metadata,
+            MediaReference::GeneratorReference { metadata, .. } => metadata,
+        }
+    }
+
+    pub fn target_url(&self) -> Option<&String> {
+        match self {
+            MediaReference::ExternalReference { target_url, .. } => Some(target_url),
+            MediaReference::GeneratorReference { .. } => None,
+        }
+    }
+
+    /// Clear the `target_url` on an external reference, leaving an empty string.
+    ///
+    /// No-op for generator references, which have no `target_url`.
+    pub fn clear_target_url(&mut self) {
+        if let MediaReference::ExternalReference { target_url, .. } = self {
+            target_url.clear();
+        }
+    }
+
+    pub fn generator_kind(&self) -> Option<&String> {
+        match self {
+            MediaReference::ExternalReference { .. } => None,
+            MediaReference::GeneratorReference { generator_kind, .. } => Some(generator_kind),
+        }
+    }
+
+    pub fn parameters(&self) -> Option<&GeneratorParameters> {
+        match self {
+            MediaReference::ExternalReference { .. } => None,
+            MediaReference::GeneratorReference { parameters, .. } => Some(parameters),
+        }
+    }
+
+    pub fn media_start(&self) -> Seconds {
+        self.available_range()
+            .as_ref()
+            .map(|tr| tr.start_time.to_seconds())
+            .unwrap_or(0.0)
+    }
+
+    pub fn set_media_start(&mut self, start_seconds: Seconds) {
+        let available_range = self.available_range_mut();
+        if let Some(tr) = available_range {
+            tr.start_time.set_from_seconds(start_seconds);
+        } else {
+            *available_range = Some(TimeRange {
+                otio_schema: default_time_range_schema(),
+                duration: RationalTime {
+                    otio_schema: default_rational_time_schema(),
+                    rate: 1.0,
+                    value: 0.0,
+                },
+                start_time: RationalTime {
+                    otio_schema: default_rational_time_schema(),
+                    rate: 1.0,
+                    value: start_seconds,
+                },
+            });
+        }
+    }
+
+    pub fn media_duration(&self) -> Option<Seconds> {
+        self.available_range()
+            .as_ref()
+            .map(|tr| tr.duration.to_seconds())
+    }
+
+    pub fn set_media_duration(&mut self, duration_seconds: Option<Seconds>) {
+        let available_range = self.available_range_mut();
+        match duration_seconds {
+            Some(v) => {
+                if let Some(tr) = available_range {
+                    tr.duration.set_from_seconds(v);
+                } else {
+                    *available_range = Some(TimeRange {
+                        otio_schema: default_time_range_schema(),
+                        duration: RationalTime {
+                            otio_schema: default_rational_time_schema(),
+                            rate: 1.0,
+                            value: v,
+                        },
+                        start_time: RationalTime {
+                            otio_schema: default_rational_time_schema(),
+                            rate: 1.0,
+                            value: 0.0,
+                        },
+                    });
+                }
+            }
+            None => {
+                *available_range = None;
+            }
+        }
+    }
+
+    /// Get the Rich Text Title HTML from a GeneratorReference
+    /// Returns None if this is not a GeneratorReference or if the Rich Text effect is not found
+    pub fn get_rich_text(&self) -> Option<String> {
+        if let MediaReference::GeneratorReference { parameters, .. } = self {
+            if let Some(resolve_otio_effects) = &parameters.resolve_otio {
+                for effect in resolve_otio_effects {
+                    if effect.effect_name == "Rich Text" && effect.effect_type == 24 {
+                        for parameter in &effect.parameters {
+                            if let ResolveOTIOParameter::Unknown(param) = parameter {
+                                if param.parameter_id == "title blob" {
+                                    return param.title_html.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct RationalTime {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_rational_time_schema")]
+    pub otio_schema: String,
+    pub rate: f64,
+    pub value: Seconds,
+}
+
+impl Default for RationalTime {
+    fn default() -> Self {
+        Self {
+            otio_schema: default_rational_time_schema(),
+            rate: 1.0,
+            value: 0.0,
+        }
+    }
+}
+
+impl RationalTime {
+    pub fn from_seconds(seconds: Seconds) -> Self {
+        Self {
+            otio_schema: default_rational_time_schema(),
+            rate: 1.0,
+            value: seconds,
+        }
+    }
+
+    pub fn to_seconds(&self) -> Seconds {
+        if self.rate.abs() > f64::EPSILON {
+            self.value / self.rate
+        } else {
+            self.value
+        }
+    }
+
+    pub fn set_from_seconds(&mut self, seconds: Seconds) {
+        self.value = if self.rate.abs() > f64::EPSILON {
+            seconds * self.rate
+        } else {
+            seconds
+        };
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct TimeRange {
+    #[serde(rename = "OTIO_SCHEMA", default = "default_time_range_schema")]
+    pub otio_schema: String,
+    pub duration: RationalTime,
+    pub start_time: RationalTime,
+}
+
+impl Default for TimeRange {
+    fn default() -> Self {
+        Self {
+            otio_schema: default_time_range_schema(),
+            duration: RationalTime::default(),
+            start_time: RationalTime::default(),
+        }
+    }
+}
+
+impl TimeRange {
+    pub fn new(duration: Seconds, start_time: Seconds) -> Self {
+        Self {
+            otio_schema: default_time_range_schema(),
+            duration: RationalTime {
+                otio_schema: default_rational_time_schema(),
+                rate: 1.0,
+                value: duration,
+            },
+            start_time: RationalTime {
+                otio_schema: default_rational_time_schema(),
+                rate: 1.0,
+                value: start_time,
+            },
+        }
+    }
+    pub fn get_duration(&self) -> Seconds {
+        self.duration.to_seconds()
+    }
+    pub fn get_start_time(&self) -> Seconds {
+        self.start_time.to_seconds()
+    }
+    pub fn set_duration(&mut self, duration: Seconds) {
+        self.duration.set_from_seconds(duration);
+    }
+    pub fn set_start_time(&mut self, start_time: Seconds) {
+        self.start_time.set_from_seconds(start_time);
+    }
+}
+
+impl Default for Timeline {
+    fn default() -> Self {
+        Self {
+            otio_schema: default_timeline_schema(),
+            name: None,
+            tracks: Stack::default(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
+
+impl Timeline {
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        crate::to_json_with_precision(self, None, true)
+    }
+    pub fn to_json_with_options(
+        &self,
+        precision: Option<usize>,
+        pretty: bool,
+    ) -> serde_json::Result<String> {
+        crate::to_json_with_precision(self, precision, pretty)
+    }
+    pub fn add_track(&mut self, track: Track) {
+        self.tracks.add_track(track);
+    }
+    pub fn add_track_at(&mut self, track: Track, insertion_index: isize) -> bool {
+        self.tracks.add_track_at(track, insertion_index)
+    }
+    pub fn reorder_track(&mut self, id: &str, insertion_index: isize) -> bool {
+        self.tracks.reorder_track(id, insertion_index)
+    }
+    pub fn sync_track_info(&self) -> Vec<crate::SyncTrackInfo> {
+        self.tracks.sync_track_info()
+    }
+    pub fn delete_track(&mut self, id: &str) -> Option<Track> {
+        self.tracks.delete_track(id)
+    }
+    /// See [`Stack::rename_track`].
+    pub fn rename_track(&mut self, id: &str, name: Option<String>) -> bool {
+        self.tracks.rename_track(id, name)
+    }
+    /// Clear the `target_url` on every media reference of every clip, on
+    /// every effect (see [`crate::effect_assets`]) and on every uploaded font
+    /// (see [`crate::fonts`]) in the timeline.
+    ///
+    /// Used before serving a project or applying a front-end update so that
+    /// ephemeral (e.g. presigned) URLs are not persisted or sent onward;
+    /// consumers re-resolve them from the media reference metadata and the
+    /// effects' and fonts' `asset_id` instead.
+    pub fn clear_target_urls(&mut self) {
+        self.clear_effect_target_urls();
+        self.clear_font_target_urls();
+        for track in &mut self.tracks.children {
+            for item in &mut track.items {
+                item.clear_media_target_urls();
+            }
+        }
+    }
+}
+
+impl Default for Track {
+    fn default() -> Self {
+        Self::new(TrackKind::Video, None)
+    }
+}
+
+impl Track {
+    pub fn new(kind: TrackKind, id: Option<String>) -> Self {
+        let mut t = Track {
+            otio_schema: default_track_schema(),
+            enabled: true,
+            kind,
+            name: None,
+            items: vec![],
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            effects: Vec::new(),
+            markers: Vec::new(),
+        };
+        crate::metadata::IdMetadataExt::set_id(&mut t, Some(id.unwrap_or_else(gen_hex_id_12)));
+        t
+    }
+    pub fn start_time_of_item(&self, index: usize) -> Seconds {
+        let mut acc: Seconds = 0.0;
+        for (i, it) in self.items.iter().enumerate() {
+            if i >= index {
+                break;
+            }
+            acc += it.duration().max(0.0);
+        }
+        acc
+    }
+
+    pub fn total_duration(&self) -> Seconds {
+        self.items.iter().map(|it| it.duration().max(0.0)).sum()
+    }
+
+    pub fn timeline_ids(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter_map(crate::metadata::IdMetadataExt::get_id)
+            .collect()
+    }
+}
+
+impl Stack {
+    pub fn get_track_by_id(&self, id: &str) -> Option<(usize, &Track)> {
+        for (i, tr) in self.children.iter().enumerate() {
+            if crate::metadata::IdMetadataExt::get_id(tr).as_deref() == Some(id) {
+                return Some((i, tr));
+            }
+        }
+        None
+    }
+
+    /// Every track whose name is exactly `name`, in stack order.
+    ///
+    /// Track names are display labels, not keys: nothing stops two tracks from
+    /// sharing one, so this can return several matches. Callers that want a
+    /// single track should use [`Stack::get_track_by_name`].
+    pub fn find_tracks_by_name(&self, name: &str) -> Vec<(usize, &Track)> {
+        self.children
+            .iter()
+            .enumerate()
+            .filter(|(_, tr)| tr.name.as_deref() == Some(name))
+            .collect()
+    }
+
+    /// The one track named `name`.
+    ///
+    /// Returns `None` both when no track carries the name and when several do —
+    /// an ambiguous name has no correct answer, so it is not resolved to an
+    /// arbitrary track. Use [`Stack::find_tracks_by_name`] to tell the two
+    /// cases apart, or [`Stack::get_track_by_id`] when the caller holds an id.
+    pub fn get_track_by_name(&self, name: &str) -> Option<(usize, &Track)> {
+        let mut matches = self.find_tracks_by_name(name).into_iter();
+        let only = matches.next()?;
+        matches.next().is_none().then_some(only)
+    }
+}

@@ -1,0 +1,28 @@
+# Rust
+/target
+**/target
+
+# Python
+**/.venv
+**/__pycache__/
+**/*.pyc
+**/build/
+**/dist/
+**/*.egg-info/
+
+# Python extension module artifacts
+bindings/python/python/tellers_timeline/*.so
+bindings/python/python/tellers_timeline/*.pyd
+
+# wasm-pack
+pkg/
+
+# Flutter/Dart
+**/.dart_tool/
+**/.packages
+**/build/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store

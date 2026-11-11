@@ -1,0 +1,262 @@
+use crate::{
+    strip_moved_detection_settings, IdMetadataExt, Item, Stack,
+    Timeline, Track,
+};
+use std::collections::{HashMap, HashSet};
+
+impl Timeline {
+    pub fn sanitize(&mut self) {
+        self.tracks.sanitize();
+    }
+}
+
+impl Track {
+    pub(crate) fn sanitize(&mut self) {
+        self.sanitize_composites();
+        self.clamp_clips_to_available_ranges();
+        self.clamp_negative_durations();
+        self.remove_zero_length_items();
+        self.remove_invalid_transitions();
+        self.merge_adjacent_gaps();
+        self.remove_trailing_gap();
+    }
+
+    pub(crate) fn sanitize_preserving_all_gap_track(&mut self) {
+        self.sanitize_composites();
+        self.clamp_clips_to_available_ranges();
+        self.clamp_negative_durations();
+        self.remove_zero_length_items();
+        self.remove_invalid_transitions();
+        self.merge_adjacent_gaps();
+        if !self.items.iter().all(|item| matches!(item, Item::Gap(_))) {
+            self.remove_trailing_gap();
+        }
+    }
+
+    /// [`Track::sanitize`] for a composite's track: its trailing gap stays,
+    /// being part of the composite's length.
+    pub(crate) fn sanitize_composite_track(&mut self) {
+        self.sanitize_composites();
+        self.clamp_clips_to_available_ranges();
+        self.clamp_negative_durations();
+        self.remove_zero_length_items();
+        self.remove_invalid_transitions();
+        self.merge_adjacent_gaps();
+    }
+
+    /// Sanitize the tracks of every composite on this track. Their trailing
+    /// gaps stay: without a source range they are part of the composite's
+    /// length.
+    fn sanitize_composites(&mut self) {
+        for item in &mut self.items {
+            let Item::Composite(stack) = item else {
+                continue;
+            };
+            for track in &mut stack.children {
+                track.sanitize_composites();
+                track.clamp_clips_to_available_ranges();
+                track.clamp_negative_durations();
+                track.remove_zero_length_items();
+                track.merge_adjacent_gaps();
+            }
+        }
+    }
+
+    pub(crate) fn clamp_clips_to_available_ranges(&mut self) {
+        for it in &mut self.items {
+            it.clamp_to_active_available_range();
+        }
+    }
+
+    pub(crate) fn clamp_negative_durations(&mut self) {
+        for it in &mut self.items {
+            if it.duration() < 0.0 {
+                it.set_duration(0.0);
+            }
+        }
+    }
+
+    /// Drop clips and gaps with no duration. Transitions are zero-length by
+    /// design and are kept; [`Track::remove_invalid_transitions`] handles them.
+    pub(crate) fn remove_zero_length_items(&mut self) {
+        self.items
+            .retain(|it| it.is_transition() || it.duration() > 0.0);
+    }
+
+    /// Drop transitions that no longer sit between two regular items: OTIO
+    /// forbids two adjacent transitions, and a transition needs a neighbour on
+    /// at least one side to have anything to dissolve.
+    pub(crate) fn remove_invalid_transitions(&mut self) {
+        let mut keep = Vec::with_capacity(self.items.len());
+        for (i, item) in self.items.iter().enumerate() {
+            if !item.is_transition() {
+                keep.push(true);
+                continue;
+            }
+            let prev_is_transition = i > 0 && self.items[i - 1].is_transition();
+            let alone = self.items.len() == 1;
+            keep.push(!prev_is_transition && !alone);
+        }
+        let mut keep = keep.into_iter();
+        self.items.retain(|_| keep.next().unwrap_or(true));
+    }
+
+    pub(crate) fn merge_adjacent_gaps(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        let mut merged: Vec<Item> = Vec::with_capacity(self.items.len());
+        for item in self.items.drain(..) {
+            match (merged.last_mut(), &item) {
+                (Some(Item::Gap(prev)), Item::Gap(next)) => {
+                    let duration =
+                        prev.source_range.duration.to_seconds() + next.source_range.duration.to_seconds();
+                    prev.source_range.duration.set_from_seconds(duration);
+                }
+                _ => merged.push(item),
+            }
+        }
+        self.items = merged;
+    }
+
+    pub(crate) fn remove_trailing_gap(&mut self) {
+        if self
+            .items
+            .last()
+            .is_some_and(|item| matches!(item, Item::Gap(_)))
+        {
+            self.items.pop();
+        }
+    }
+}
+
+impl Stack {
+    pub fn sanitize(&mut self) {
+        for t in &mut self.children {
+            if self.composite_content {
+                t.sanitize_composite_track();
+            } else {
+                t.sanitize();
+            }
+        }
+        self.strip_moved_detection_settings();
+        self.ensure_unique_timeline_ids();
+        self.cleanup_dangling_sync_clips();
+    }
+
+    pub(crate) fn sanitize_preserving_all_gap_tracks(&mut self) {
+        for t in &mut self.children {
+            if self.composite_content {
+                t.sanitize_composite_track();
+            } else {
+                t.sanitize_preserving_all_gap_track();
+            }
+        }
+        self.strip_moved_detection_settings();
+        self.ensure_unique_timeline_ids();
+        self.cleanup_dangling_sync_clips();
+    }
+
+    /// Drop the detection settings now the player's (video-player-js #690)
+    /// from the effects of the stack, its tracks and their items, at any
+    /// depth; see [`strip_moved_detection_settings`].
+    fn strip_moved_detection_settings(&mut self) {
+        fn strip_tracks(tracks: &mut [Track]) {
+            for track in tracks {
+                strip_moved_detection_settings(&mut track.effects);
+                for item in &mut track.items {
+                    match item {
+                        Item::Clip(clip) => {
+                            strip_moved_detection_settings(&mut clip.effects);
+                        }
+                        Item::Composite(stack) => {
+                            strip_moved_detection_settings(&mut stack.effects);
+                            strip_tracks(&mut stack.children);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        strip_moved_detection_settings(&mut self.effects);
+        strip_tracks(&mut self.children);
+    }
+
+    fn ensure_unique_timeline_ids(&mut self) {
+        let mut used_ids = HashSet::new();
+        for track in &mut self.children {
+            ensure_unique_timeline_id(track, &mut used_ids);
+            ensure_unique_item_ids(&mut track.items, &mut used_ids);
+        }
+    }
+
+    fn cleanup_dangling_sync_clips(&mut self) {
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for track in &self.children {
+            for item in &track.items {
+                let Item::Clip(clip) = item else {
+                    continue;
+                };
+                if let Some(sync_clips_id) = clip.sync_clips_id() {
+                    *counts.entry(sync_clips_id).or_default() += 1;
+                }
+            }
+        }
+
+        for track in &mut self.children {
+            for item in &mut track.items {
+                let Item::Clip(clip) = item else {
+                    continue;
+                };
+                let Some(sync_clips_id) = clip.sync_clips_id() else {
+                    continue;
+                };
+                if counts.get(&sync_clips_id).copied().unwrap_or_default() < 2 {
+                    remove_resolve_sync_clips_id(&mut clip.metadata);
+                }
+            }
+        }
+    }
+}
+
+/// Unique ids for `items`, and for the tracks and items nested in composites.
+fn ensure_unique_item_ids(items: &mut [Item], used_ids: &mut HashSet<String>) {
+    for item in items {
+        ensure_unique_timeline_id(item, used_ids);
+        if let Item::Composite(stack) = item {
+            for track in &mut stack.children {
+                ensure_unique_timeline_id(track, used_ids);
+                ensure_unique_item_ids(&mut track.items, used_ids);
+            }
+        }
+    }
+}
+
+fn ensure_unique_timeline_id<T: IdMetadataExt>(value: &mut T, used_ids: &mut HashSet<String>) {
+    if let Some(id) = value.get_id().filter(|id| !id.is_empty()) {
+        if used_ids.insert(id) {
+            return;
+        }
+    }
+
+    value.set_id(Some(new_unused_timeline_id(used_ids)));
+}
+
+fn new_unused_timeline_id(used_ids: &mut HashSet<String>) -> String {
+    loop {
+        let id = crate::types::gen_hex_id_12();
+        if used_ids.insert(id.clone()) {
+            return id;
+        }
+    }
+}
+
+fn remove_resolve_sync_clips_id(metadata: &mut serde_json::Value) -> bool {
+    let Some(resolve) = metadata
+        .get_mut("Resolve_OTIO")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return false;
+    };
+    resolve.remove("Link Group ID").is_some()
+}

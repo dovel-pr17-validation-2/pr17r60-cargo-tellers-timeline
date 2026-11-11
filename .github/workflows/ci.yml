@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y just
+      - run: just build-all
+      - run: cargo test -p tellers-timeline-core -p tellers-timeline-schema -q
+
+  docs:
+    name: docs (format reference is up to date)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Regenerate docs/otio-reference.md
+        run: cargo run -p tellers-timeline-schema --bin otio-docs --quiet
+      - name: Check it matches the committed file
+        run: |
+          if ! git diff --exit-code -- docs/otio-reference.md; then
+            echo "::error file=docs/otio-reference.md::docs/otio-reference.md is stale. Run 'just regen-docs' and commit the result (the regenerated file is attached to this run as the otio-reference artifact)."
+            exit 1
+          fi
+      - name: Attach the regenerated reference
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: otio-reference
+          path: docs/otio-reference.md
+
+  python-binding:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Set up venv and install deps
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin pytest opentimelineio==0.18.1
+      - name: Build and develop Python extension
+        run: |
+          source .venv/bin/activate
+          maturin develop -m bindings/python/Cargo.toml -q
+      - name: Run Python tests
+        run: |
+          source .venv/bin/activate
+          pytest -q bindings/python/tests --ignore=bindings/python/tests/test_official_otio.py
+      - name: Check written .otio parses in official OpenTimelineIO
+        env:
+          REQUIRE_OFFICIAL_OTIO: '1'
+        run: |
+          source .venv/bin/activate
+          pytest -q bindings/python/tests/test_official_otio.py
