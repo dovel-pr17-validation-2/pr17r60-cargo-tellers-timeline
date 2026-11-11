@@ -167,9 +167,9 @@ fn default_enabled() -> bool {
 }
 
 pub(crate) fn gen_hex_id_12() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 6];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
